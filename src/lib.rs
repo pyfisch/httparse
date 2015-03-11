@@ -288,11 +288,37 @@ fn parse_code(buf: &[u8]) -> Result<Status<u16>, Error> {
 
 #[inline]
 fn parse_headers<'a>(headers: &mut [Header<'a>], buf: &'a [u8]) -> Result<Status<usize>, Error> {
+    let buf_len = buf.len();
     let mut i: usize = 0;
     let mut last_i: usize = 0;
+
+    macro_rules! eof {
+        () => (if i == buf_len {
+            return Ok(Status::Partial);
+        })
+    }
+
+    macro_rules! next {
+        () => ({
+            eof!();
+            let ret = unsafe { *buf.get_unchecked(i) };
+            i += 1;
+            ret
+        })
+    }
+
+    macro_rules! expect {
+        ($buf:ident[$i:ident] == $pat:pat => $ret:expr) => {
+            match next!() {
+                v@$pat => v,
+                _ => return $ret
+            }
+        }
+    }
+
     'headers: for header in headers {
         // a newline here means the head is over!
-        eof!(buf, i);
+        eof!();
         let b = unsafe { *buf.get_unchecked(i) };
         if b == b'\r' {
             i += 1;
@@ -306,7 +332,7 @@ fn parse_headers<'a>(headers: &mut [Header<'a>], buf: &'a [u8]) -> Result<Status
         last_i = i;
         // parse header name until colon
         loop {
-            let b = next!(buf, i);
+            let b = next!();
             if b == b':' {
                 header.name = unsafe {
                     str::from_utf8_unchecked(slice!(buf[last_i;i - 1]))
@@ -319,7 +345,7 @@ fn parse_headers<'a>(headers: &mut [Header<'a>], buf: &'a [u8]) -> Result<Status
 
         // eat white space between colon and value
         loop {
-            let b = next!(buf, i);
+            let b = next!();
             if !(b == b' ' || b == b'\t') {
                 i -= 1;
                 last_i = i;
@@ -329,27 +355,21 @@ fn parse_headers<'a>(headers: &mut [Header<'a>], buf: &'a [u8]) -> Result<Status
 
         // parse value till EOL
 
+        let mut b = 0;
+        let mut non_token = false;
         macro_rules! check {
             () => ({
-                let b = unsafe { *buf.get_unchecked(i) };
+                b = unsafe { *buf.get_unchecked(i) };
                 i += 1;
                 if !is_token!(b) {
                     if (b < 0o40 && b != 0o11) || b == 0o177 {
-                        if b == b'\r' {
-                            expect!(buf[i] == b'\n' => Err(Error::HeaderValue));
-                            header.value = slice!(buf[last_i;i - 2]);
-                            continue 'headers;
-                        } else if b == b'\n' {
-                            header.value = slice!(buf[last_i;i - 1]);
-                            continue 'headers;
-                        } else {
-                            return Err(Error::HeaderValue);
-                        }
+                        non_token = true;
+                        break;
                     }
                 }
             })
         }
-        while buf.len() - i >= 8 {
+        while buf_len - i >= 8 {
             check!();
             check!();
             check!();
@@ -359,22 +379,24 @@ fn parse_headers<'a>(headers: &mut [Header<'a>], buf: &'a [u8]) -> Result<Status
             check!();
             check!();
         }
-        loop {
-            let b = next!(buf, i);
-            if !is_token!(b) {
-                if (b < 0o40 && b != 0o11) || b == 0o177 {
-                    if b == b'\r' {
-                        expect!(buf[i] == b'\n' => Err(Error::HeaderValue));
-                        header.value = slice!(buf[last_i;i - 2]);
+        if !non_token {
+            loop {
+                b = next!();
+                if !is_token!(b) {
+                    if (b < 0o40 && b != 0o11) || b == 0o177 {
                         break;
-                    } else if b == b'\n' {
-                        header.value = slice!(buf[last_i;i - 1]);
-                        break;
-                    } else {
-                        return Err(Error::HeaderValue);
                     }
                 }
             }
+        }
+
+        if b == b'\r' {
+            expect!(buf[i] == b'\n' => Err(Error::HeaderValue));
+            header.value = slice!(buf[last_i;i - 2]);
+        } else if b == b'\n' {
+            header.value = slice!(buf[last_i;i - 1]);
+        } else {
+            return Err(Error::HeaderValue);
         }
     }
 
